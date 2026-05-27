@@ -1,0 +1,160 @@
+---
+title: "Projet"
+author: "Marie-Anne Randrianarivony"
+date: "2026-05-13"
+output: html_document
+---
+
+# Chargement des packages
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+```{r load-packages}
+
+library(tidyverse)
+library(lubridate)
+library(httr2)
+library(jsonlite)
+library(janitor)
+library(shiny)
+library(glue)
+
+```
+
+```{r load-data}
+
+# Chargement des données de Hydro Québec sur les demandes d'électricité
+df <- read.csv("C:/Users/Marie-Anne/OneDrive - Université du Québec à Chicoutimi/Documents/Prediction-de-la-demande-energetique-Hydro-Quebec-/data/historique-demande-electricite-quebec.csv")
+  
+head(df)
+
+# Chargement des données météorologiques correspondant aux dates des demandes
+df_meteo <-read.csv("C:/Users/Marie-Anne/OneDrive - Université du Québec à Chicoutimi/Documents/Prediction-de-la-demande-energetique-Hydro-Quebec-/data/open-meteo-45.52N73.61W226m.csv",
+skip = 3 #pour sauter les 3 premières lignes d'informations
+) 
+
+head(df_meteo)
+```
+
+# 1. Nettoyage des données
+
+## Conversion de la colonne date dans les 2 jeux de données au bon format
+
+```{r conversion-date}
+
+df <- df %>% 
+  mutate(date=as.POSIXct(date, format="%Y-%m-%dT%H:%M", tz=Sys.timezone()))
+
+head(df)
+
+```
+
+```{r conversion-date-df-meteo}
+
+ df_meteo <- df_meteo %>%
+  rename(date = time,
+temperature = temperature_2m...C.,
+pluie = rain..mm.,
+neige = snowfall..cm.,
+precipitation = precipitation..mm.,
+vent = wind_speed_10m..km.h.
+) %>% 
+  mutate(date = as.POSIXct(date,
+                               format = "%Y-%m-%dT%H:%M",
+                               tz = Sys.timezone())) %>%
+  filter(!is.na(date)) # Suppression des observations sans date 
+
+
+head(df_meteo)
+```
+
+
+```{r colonne-demande}
+df <- df %>% 
+  rename(demande_energetique = demande..MW.)
+```
+
+```{r nombre-de-variables}
+print("Les colonnes dans le jeu de donnée des demandes énergétiques:")
+colnames(df)
+
+print("Les colonnes dans le jeu de données des informations météorologiques")
+colnames(df_meteo)
+```
+
+## Fusion des jeux de données
+
+```{r merge}
+df_fusionne <- merge(df,df_meteo, by=c("date"))
+
+head(df_fusionne)
+```
+
+
+```{r nombres-d-observations}
+nrow(df_fusionne)
+```
+
+
+```{r nombres-de-variables}
+ncol(df_fusionne)
+```
+## Gestion des valeurs manquantes
+
+```{r nan}
+
+sum(is.na(df_fusionne))
+```
+On observe 45 données manquantes sur 43 824 observations.Étant donné que les valeurs manquantes ne sont pas trop importantes, on peut décider de les supprimer.
+
+```{r suppression-nan}
+df_fusionne <- df_fusionne %>% 
+  drop_na()
+
+```
+
+
+## Intervalles de dates
+
+```{r date-min-max}
+date_debut <-format(min(df_fusionne$date, na.rm=TRUE), "%Y-%m-%d")
+date_debut
+date_fin <- format(max(df_fusionne$date, na.rm=TRUE), "%Y-%m-%d" )
+date_fin
+```
+
+## Gestion des valeurs aberrantes
+
+Afin de gérer les valeurs aberrantes, l'utilisation de la méthode de la distance interquartile est idéal.
+
+**Référence**: GitHub Documentation, https://essicolo.github.io/ecologie-mathematique-R/chapitre-outliers.html#valeurs-et-%C3%A9chantillons-aberrants-d%C3%A9finition-origines-m%C3%A9thodes-de-d%C3%A9tection-et-traitement
+```{r fonction-distance-iqr}
+# Définition de la fonction calculant la distance interquartile
+iqr_01 <- function(x, probs = c(.25, .75), mult = 1.5, na.rm = TRUE) {
+  
+  io <- rep(NA, length(x)) # vecteur vide qui consignera si la valeur est aberrante ou non
+  limits <- quantile(x, probs = probs, na.rm = na.rm)
+  
+  offset <- mult * (limits[2] - limits[1]) # calculer la distance limite des quartiles
+  
+  io[x > (limits[2] + offset) | x < (limits[1] - offset)] <- 0 # si en-deça ou au-delà des limites
+  io[x <= (limits[2] + offset) & x >= (limits[1] - offset)] <- 1 # si à l'intérieur des limites
+  return(io)
+}
+```
+
+```{r valeurs-aberrantes}
+df_fusionne <- df_fusionne %>% 
+  mutate(io = iqr_01(demande_energetique)) %>%  # on détecte les valeurs aberrantes
+  filter(io == 1) %>% # on conserve que les valeurs non aberrantes
+  select(-io) # enlver la colonne io
+```
+
+
+
+
+
