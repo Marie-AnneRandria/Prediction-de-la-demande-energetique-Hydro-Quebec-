@@ -22,7 +22,8 @@ library(jsonlite)
 library(janitor)
 library(shiny)
 library(glue)
-
+library(pheatmap)
+library(ggplot2)
 ```
 
 ```{r load-data}
@@ -103,6 +104,7 @@ nrow(df_fusionne)
 ```{r nombres-de-variables}
 ncol(df_fusionne)
 ```
+
 ## Gestion des valeurs manquantes
 
 ```{r nan}
@@ -147,14 +149,183 @@ iqr_01 <- function(x, probs = c(.25, .75), mult = 1.5, na.rm = TRUE) {
 }
 ```
 
-```{r valeurs-aberrantes}
+
+En utilisant la méthode de l'intervalle interquartile
+
+```{r valeurs-aberrantes-IQR}
+summary(df_fusionne$temperature)
+
+Q1 <- quantile(df_fusionne$temperature, 0.25, na.rm=TRUE)
+Q3 <- quantile(df_fusionne$temperature, 0.75, na.rm=TRUE)
+IQR <- Q3 - Q1
+
+borne_inferieure <- Q1 - 1.5*IQR
+borne_superieure <- Q3 - 1.5*IQR
+
+cat("Borne inférieure:", borne_inferieure, "°C\n")
+cat("Borne supérieure:", borne_superieure, "°C\n")
+
+# Nombre de valeurs aberrantes
+outliers_temp <- df_fusionne %>% 
+  filter(temperature < borne_inferieure | temperature > borne_superieure)
+
+cat("Nombre de valeurs aberrantes:", nrow(outliers_temp), "\n")
+
+```
+On observe 40 585 valeurs aberrantes pour les températures.
+
+
+
+# 2. Analyse exploratoire des données
+
+## Séparation des variables temporelles en heure, jour, mois, année et weekend
+```{r separation-variable-temporelle}
 df_fusionne <- df_fusionne %>% 
-  mutate(io = iqr_01(demande_energetique)) %>%  # on détecte les valeurs aberrantes
-  filter(io == 1) %>% # on conserve que les valeurs non aberrantes
-  select(-io) # enlver la colonne io
+  mutate(
+    heure = hour(date),
+    jour = wday(date, label =TRUE, abbr = FALSE),
+    mois = month(date, label =TRUE, abbr =FALSE),
+    annee = year(date),
+    weekend = wday(date) %in% c(1,7)
+  )
 ```
 
+## Distribution de la demande énergétique
+
+```{r distribution-demande-energetique}
+ggplot(df_fusionne, aes(x=demande_energetique)) +
+  geom_histogram(bins = 60, fill ="#FFAC1C", color="white", linewidth =0.2) +
+ 
+  labs(title = "Distribution de la demande énergétique", 
+       x="Demande (MW)", y ="Fréquence") +
+  theme_minimal()
+```
+
+On observe une distribution bimodiale. La première pic autour de 10 000 MW et une deuxième pic autour de 20 000 MW. Ces pics peuvent s'expliquer par des conditions météorologiques extrêmes ou douces. 
+
+On peut également observer qu'il y a des valeurs qui s'étendent autour des 30 000 MW.
+
+## Évolution temporelle sur 6 ans
+
+```{r evolution-temporelle }
+df_fusionne %>% 
+  group_by(semaine = floor_date(date, "week")) %>%
+  summarise(demande_moyenne = mean(demande_energetique, na.rm =TRUE)) %>% 
+  ggplot(aes(x =semaine, y = demande_moyenne)) +
+  geom_line(color ="#F4BB44", linewidth = 0.7) +
+  theme(plot.title = element_text(size = 10),
+        plot.subtitle =element_text(size = 8)) +
+  labs(title= "Évolution de la demande énergétique (2019-2024)",
+       subtitle = "Moyenne hebdomadaire",
+       x = NULL, y="Demande moyenne (MW)") +
+theme_minimal()
+```
+
+On observe que chaque année, la consommation énergétique peut être dans les alentours de 30 000 MW. En 2022, la consommation énergétique a dépassé les 30 000 MW.
+
+## Tendance  mensuelle de la demande énergétique
+
+```{r tendance-mensuelle}
+df_fusionne %>% 
+  group_by(mois) %>% 
+  summarise(
+    demande_moyenne = mean(demande_energetique, na.rm =TRUE),
+    p10 = quantile(demande_energetique, 0.10, na.rm =TRUE),
+    p90 = quantile(demande_energetique, 0.90, na.rm=TRUE)
+  ) %>% 
+  ggplot(aes(x =mois, y =demande_moyenne, groupe = 1)) +
+  geom_ribbon(aes(ymin = p10, ymax= p90), fill ="#F4BB44", alpha = 0.5) +
+  geom_line(color = "#CC7722", linewidth=1.2) +
+  geom_point(color = "#CC7722", size=3) +
+  labs(title="Tendance mensuelle de la demande énergétique", subtitle = "Ligne = moyenne", x =NULL, y="Demande énergétique (MW)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust =1),
+        plot.title =element_text(size=10),
+        plot.subtitle =element_text(size=8))
+
+```
+
+Cette tendance  mensuelle se base sur toutes les années de 2019 jusqu'à 2024. On constate que pendant la saison hivernale, on a des hausses de demande énergétique autour de 30000 MW, plus exactement en Janvier et Février. Tandis que durant la saison estivale, les demandes sont en baisses aux alentours de 17 000 MW de Mai jusqu'en Août. 
+
+On constate que la température est une variable influencant les demandes énergétiques.
 
 
+## Relation entre la demande et la température 
+
+```{r relation-demande-temperature}
+df_fusionne %>% 
+  # regrouper les températures en intervalle de 2°C
+  mutate(temp_bin = cut(temperature, breaks = seq(-30, 40, by=2))) %>% 
+  # calculer la demande moyenne par groupe crée ci-dessus
+  group_by(temp_bin) %>% 
+  summarise(
+    demande_moyenne = mean(demande_energetique, na.rm=TRUE),
+    temp_moyenne = mean(temperature, na.rm=TRUE),
+    n = n()
+  ) %>% 
+  # Filtrage des groupes avec peu d'observations
+  filter(n>20) %>% 
+  ggplot(aes(x = temp_moyenne, y = demande_moyenne)) +
+  geom_point(aes(size=n), color="#FF7F50", alpha = 0.7) +
+  geom_smooth(method="loess", se=TRUE, color="#A0522D", fill="#FFDEAD") +
+  labs(title="Relation entre demande et température",
+x="Température (°C)",
+y="Demande moyenne (MW)", 
+size="Nombre d'obsevations") +
+theme(plot.title =element_text(size=5)) +
+  theme_minimal()
+```
+
+Lorsque la température  est autour de 10°C et 20°C, les clients consomment moins d'électricité. Hors lorsque les températures chutent en dessous de 0°C, les clients consomment plus. Cela est dû aux chauffages électrique. Plus la température baisse, plus le client a tendance a utilisé plus d'énergie. Lorsque la température augmente, les clients consomment légèrement moins d'électricité.
+
+
+## Courbe montrant la tendance de la demande énergétique durant la semaine et par heure
+
+```{r graphique-heure-semaine}
+df_fusionne %>% 
+  mutate(jour = ifelse(weekend, "Weekend", "Semaine")) %>% 
+  group_by(heure, jour) %>% 
+  summarise(demande_moyenne = mean(demande_energetique, na.rm=TRUE), .groups="drop") %>% 
+  ggplot(aes(x = heure, y = demande_moyenne, color =jour)) + 
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values=c("Semaine" = "#085041", "Weekend"= "#EF9F27")) +
+  scale_x_continuous(breaks = seq(0,23,3)) +
+                       labs(title="Demande énergétique",
+                            subtitle="Durant la semaine et par heure",
+                            x="Heure", 
+                            y="Demande moyenne (MW)", color=NULL) +
+                       theme_minimal() +
+                       theme(legend.position ="top")
+```
+
+Les clients de Hydro Québec consomment plus d'énergie pendant les jours ouvrables et consomment moins la fin de semaine. 
+
+Pendant les jours ouvrables, on observe que les demandes énergétiques s'intensifient entre 7h et 10h ce qui peut réfleter le réveil et le début du travail. Elles s'intensifient également entre 18h et 19h ce qui correspondent aux heures de retours du travail.
+
+
+
+```{r matrice-correlation}
+df_fusionne %>% 
+  select(demande_energetique, temperature, pluie, neige, precipitation, vent) %>% 
+  cor(use ="pairwise.complete.obs") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("var1") %>% 
+  pivot_longer(-var1, names_to="var2", values_to="correlation") %>% 
+  ggplot(aes(x=var1, y=var2, fill=correlation)) +
+  geom_tile(color="white") +
+  geom_text(aes(label=round(correlation, 2)) , size=3.5) +
+  scale_fill_gradient2(low="#993C1D", mid="white", high="#085041", midpoint=0, limits=c(-1,1)) +
+  labs(title="Matrice de corrélation", x=NULL, y=NULL) +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+
+Nous pouvons constater que la température représente une variable importante. On a une corrélation de 82% avec la demande énergétique.
+
+On constate une relation entre la demande énergétique et la variable "neige". On a une corrélation de 19%. Ce qui est évident, étant donné que la baisse de température est dû en partie à cause de la neige.
+
+On remarque également qu'il y a une corrélation entre la pluie et les précipitations.
+
+Le vent ne représente pas une influence directe sur la consommation électrique.
 
 
