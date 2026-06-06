@@ -24,6 +24,7 @@ library(shiny)
 library(glue)
 library(pheatmap)
 library(ggplot2)
+library(slider)
 ```
 
 ```{r load-data}
@@ -324,8 +325,131 @@ Nous pouvons constater que la température représente une variable importante. 
 
 On constate une relation entre la demande énergétique et la variable "neige". On a une corrélation de 19%. Ce qui est évident, étant donné que la baisse de température est dû en partie à cause de la neige.
 
-On remarque également qu'il y a une corrélation entre la pluie et les précipitations.
+On remarque également qu'il y a une corrélation entre la pluie et les précipitations. Garder les deux n'apporteront rien à l'analyse. On va seulement garder la variable pluie.
 
 Le vent ne représente pas une influence directe sur la consommation électrique.
 
+# Enrichissement des données
+
+## Suppression de la variable "Précipitation"
+```{r suppression-precipitation}
+df_fusionne <- df_fusionne %>% 
+  select(-precipitation)
+```
+
+## Ajout des métriques standards à la prédiction de la demande énergétique
+
+Afin de mieux capturer la consommation énergétique, nous allons mettre au point des métriques HDD et CDD. HDD mesure la demande de chauffage en fonction des jours où la température est inférieure à une valeur de référence. CDD représente la demande de climatisation lors des journées plus chaudes.
+
+Référence: Leveraging HDD and CDD with Linear Regression for Enhancecd Energy Analysis in Python, https://www.linkedin.com/pulse/leveraging-hdd-cdd-linear-regression-enhanced-energy-analysis-kmetz-tzece/
+
+Équations mathématiques:
+
+$HDD = T_{base} - T_{mean}$ si $T_{base}$ est plus petit que $T_{mean}$.
+ $HDD = 0$, si $T_{mean}$ est plus grand que $T_{base}$.
+ 
+ où:
+ $T_{base}$ est la température de référence pour les jours à haute température, en général 65°F(18°C).
+ $T_{mean}$ est la moyenne des températures.
+ 
+
+$CDD = T_{mean} - T_{base}$ si $T_{mean}$ est plus grand que $T_{base}$.
+ $HDD = 0$, si $T_{mean}$ est plus petit que $T_{base}$.
+ 
+ où:
+ $T_{base}$ est la température de référence pour les jours à basse température, en général 65°F(18°C).
+ $T_{mean}$ est la moyenne des températures.
+ 
+ Référence: https://mrcc.purdue.edu/CLIMATE/Station/Daily/degreeday_description.html
+ 
+```{r features supplémentaires}
+df_fusionne <- df_fusionne %>% 
+  mutate(
+    hdd = pmax(0,18 - temperature),
+    cdd = pmax(0, temperature - 18),
+    
+    # Lags de température
+    temp_lag1 = lag(temperature, 1),
+    temp_lag24 = lag(temperature, 24),
+    
+    # Moyenne mobiles de température
+    temp_ma6h  = slide_dbl(temperature, mean, .before = 5,  .complete = TRUE),
+    temp_ma24h = slide_dbl(temperature, mean, .before = 23, .complete = TRUE)
+  )
+```
+
+## Encodage cyclique pour éviter le saut entre 23h et minuit
+
+```{r encodage}
+df_fusionne <- df_fusionne %>% 
+  mutate(
+    # Conversion en numérique 
+    mois_num = as.numeric(month(date)),
+    jour_num = as.numeric(wday(date, week_start=1)),
+    
+    heure_sin     = sin(2 * pi * heure / 24),
+    heure_cos     = cos(2 * pi * heure / 24),
+    mois_sin      = sin(2 * pi * mois_num / 12),
+    mois_cos      = cos(2 * pi * mois_num / 12),
+    jour_sin      = sin(2 * pi * jour_num / 7),
+    jour_cos      = cos(2 * pi * jour_num / 7)
+  )
+```
+
+## Lags de température 
+
+Afin de permettre de considérer la température de l'heure précédente et d'hier à la même heure.
+La moyenne mobile permet de lisser les variations brusques au lieu de considérer qu'un seul pic de température sur une heure donnée.
+
+```{r lag-temperature}
+df_fusionne <- df_fusionne %>% 
+  mutate(
+    temp_lag1 = lag(temperature, 1),
+temp_lag24 = lag(temperature, 24),
+
+# Moyenne mobiles de température
+temp_ma6 = slide_dbl(temperature, mean, .before = 5, .complete = TRUE),
+temp_ma24 = slide_dbl(temperature, mean, .before = 23, .complete =TRUE)
+  )
+
+```
+
+## Lags de la demande énergétique
+
+Ce lag sera servi en guise d'historique. Théoriquement, la demande d'aujourd'hui ressemblera au demande d'hier à la même heure et à la même heure de la semaine d'avant.
+
+```{r lag-demande-energetique}
+df_fusionne <- df_fusionne %>% 
+  arrange(date) %>% 
+  mutate(
+    demande_lag1 = lag(demande_energetique, 1),
+    demande_lag24 = lag(demande_energetique, 24),
+    demande_lag48 = lag(demande_energetique, 48),
+    demande_lag168 = lag(demande_energetique, 168),
+    
+    # Moyenne mobile de la demande
+    demande_ma24 = slide_dbl(demande_energetique, mean, .before=23, .complete=TRUE)
+  )
+
+# Suppression des lignes vides
+df_fusionne <- df_fusionne %>% 
+  drop_na()
+
+cat("Dimensions finales :", nrow(df_fusionne), "lignes x", ncol(df_fusionne), "colonnes\n")
+cat("Période couverte :", format(min(df_fusionne$date), "%Y-%m-%d"),
+    "→", format(max(df_fusionne$date), "%Y-%m-%d"), "\n")
+cat("\nNoms des colonnes :\n")
+print(colnames(df_fusionne))
+
+
+```
+En regardant le jeu de donnée, la plupart des valeurs de CDD sont à 0. Les lignes de codes suivant permettent d'observer qu'il y a bel et bien des valeurs ayant un CDD supérieur à 0.
+
+## Les valeurs ayant un CDD supérieur à 0
+```{r cdd-superieur-a-0}
+df_fusionne %>% 
+  filter(cdd>0) %>% 
+  select(date, temperature, cdd) %>% 
+  head(10)
+```
 

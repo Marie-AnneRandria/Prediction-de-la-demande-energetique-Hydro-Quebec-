@@ -367,7 +367,8 @@ library(janitor)
 library(shiny)
 library(glue)
 library(pheatmap)
-library(ggplot2)</code></pre>
+library(ggplot2)
+library(slider)</code></pre>
 <pre class="r"><code># Chargement des données de Hydro Québec sur les demandes d&#39;électricité
 df &lt;- read.csv(&quot;C:/Users/Marie-Anne/OneDrive - Université du Québec à Chicoutimi/Documents/Prediction-de-la-demande-energetique-Hydro-Quebec-/data/historique-demande-electricite-quebec.csv&quot;)
   
@@ -683,9 +684,155 @@ importante. On a une corrélation de 82% avec la demande énergétique.</p>
 “neige”. On a une corrélation de 19%. Ce qui est évident, étant donné
 que la baisse de température est dû en partie à cause de la neige.</p>
 <p>On remarque également qu’il y a une corrélation entre la pluie et les
-précipitations.</p>
+précipitations. Garder les deux n’apporteront rien à l’analyse. On va
+seulement garder la variable pluie.</p>
 <p>Le vent ne représente pas une influence directe sur la consommation
 électrique.</p>
+</div>
+</div>
+<div id="enrichissement-des-données" class="section level1">
+<h1>Enrichissement des données</h1>
+<div id="suppression-de-la-variable-précipitation" class="section level2">
+<h2>Suppression de la variable “Précipitation”</h2>
+<pre class="r"><code>df_fusionne &lt;- df_fusionne %&gt;% 
+  select(-precipitation)</code></pre>
+</div>
+<div id="ajout-des-métriques-standards-à-la-prédiction-de-la-demande-énergétique" class="section level2">
+<h2>Ajout des métriques standards à la prédiction de la demande
+énergétique</h2>
+<p>Afin de mieux capturer la consommation énergétique, nous allons
+mettre au point des métriques HDD et CDD. HDD mesure la demande de
+chauffage en fonction des jours où la température est inférieure à une
+valeur de référence. CDD représente la demande de climatisation lors des
+journées plus chaudes.</p>
+<p>Référence: Leveraging HDD and CDD with Linear Regression for
+Enhancecd Energy Analysis in Python, <a href="https://www.linkedin.com/pulse/leveraging-hdd-cdd-linear-regression-enhanced-energy-analysis-kmetz-tzece/" class="uri">https://www.linkedin.com/pulse/leveraging-hdd-cdd-linear-regression-enhanced-energy-analysis-kmetz-tzece/</a></p>
+<p>Équations mathématiques:</p>
+<p><span class="math inline">\(HDD = T_{base} - T_{mean}\)</span> si
+<span class="math inline">\(T_{base}\)</span> est plus petit que <span class="math inline">\(T_{mean}\)</span>. <span class="math inline">\(HDD
+= 0\)</span>, si <span class="math inline">\(T_{mean}\)</span> est plus
+grand que <span class="math inline">\(T_{base}\)</span>.</p>
+<p>où: <span class="math inline">\(T_{base}\)</span> est la température
+de référence pour les jours à haute température, en général 65°F(18°C).
+<span class="math inline">\(T_{mean}\)</span> est la moyenne des
+températures.</p>
+<p><span class="math inline">\(CDD = T_{mean} - T_{base}\)</span> si
+<span class="math inline">\(T_{mean}\)</span> est plus grand que <span class="math inline">\(T_{base}\)</span>. <span class="math inline">\(HDD
+= 0\)</span>, si <span class="math inline">\(T_{mean}\)</span> est plus
+petit que <span class="math inline">\(T_{base}\)</span>.</p>
+<p>où: <span class="math inline">\(T_{base}\)</span> est la température
+de référence pour les jours à basse température, en général 65°F(18°C).
+<span class="math inline">\(T_{mean}\)</span> est la moyenne des
+températures.</p>
+<p>Référence: <a href="https://mrcc.purdue.edu/CLIMATE/Station/Daily/degreeday_description.html" class="uri">https://mrcc.purdue.edu/CLIMATE/Station/Daily/degreeday_description.html</a></p>
+<pre class="r"><code>df_fusionne &lt;- df_fusionne %&gt;% 
+  mutate(
+    hdd = pmax(0,18 - temperature),
+    cdd = pmax(0, temperature - 18),
+    
+    # Lags de température
+    temp_lag1 = lag(temperature, 1),
+    temp_lag24 = lag(temperature, 24),
+    
+    # Moyenne mobiles de température
+    temp_ma6h  = slide_dbl(temperature, mean, .before = 5,  .complete = TRUE),
+    temp_ma24h = slide_dbl(temperature, mean, .before = 23, .complete = TRUE)
+  )</code></pre>
+</div>
+<div id="encodage-cyclique-pour-éviter-le-saut-entre-23h-et-minuit" class="section level2">
+<h2>Encodage cyclique pour éviter le saut entre 23h et minuit</h2>
+<pre class="r"><code>df_fusionne &lt;- df_fusionne %&gt;% 
+  mutate(
+    # Conversion en numérique 
+    mois_num = as.numeric(month(date)),
+    jour_num = as.numeric(wday(date, week_start=1)),
+    
+    heure_sin     = sin(2 * pi * heure / 24),
+    heure_cos     = cos(2 * pi * heure / 24),
+    mois_sin      = sin(2 * pi * mois_num / 12),
+    mois_cos      = cos(2 * pi * mois_num / 12),
+    jour_sin      = sin(2 * pi * jour_num / 7),
+    jour_cos      = cos(2 * pi * jour_num / 7)
+  )</code></pre>
+</div>
+<div id="lags-de-température" class="section level2">
+<h2>Lags de température</h2>
+<p>Afin de permettre de considérer la température de l’heure précédente
+et d’hier à la même heure. La moyenne mobile permet de lisser les
+variations brusques au lieu de considérer qu’un seul pic de température
+sur une heure donnée.</p>
+<pre class="r"><code>df_fusionne &lt;- df_fusionne %&gt;% 
+  mutate(
+    temp_lag1 = lag(temperature, 1),
+temp_lag24 = lag(temperature, 24),
+
+# Moyenne mobiles de température
+temp_ma6 = slide_dbl(temperature, mean, .before = 5, .complete = TRUE),
+temp_ma24 = slide_dbl(temperature, mean, .before = 23, .complete =TRUE)
+  )</code></pre>
+</div>
+<div id="lags-de-la-demande-énergétique" class="section level2">
+<h2>Lags de la demande énergétique</h2>
+<p>Ce lag sera servi en guise d’historique. Théoriquement, la demande
+d’aujourd’hui ressemblera au demande d’hier à la même heure et à la même
+heure de la semaine d’avant.</p>
+<pre class="r"><code>df_fusionne &lt;- df_fusionne %&gt;% 
+  arrange(date) %&gt;% 
+  mutate(
+    demande_lag1 = lag(demande_energetique, 1),
+    demande_lag24 = lag(demande_energetique, 24),
+    demande_lag48 = lag(demande_energetique, 48),
+    demande_lag168 = lag(demande_energetique, 168),
+    
+    # Moyenne mobile de la demande
+    demande_ma24 = slide_dbl(demande_energetique, mean, .before=23, .complete=TRUE)
+  )
+
+# Suppression des lignes vides
+df_fusionne &lt;- df_fusionne %&gt;% 
+  drop_na()
+
+cat(&quot;Dimensions finales :&quot;, nrow(df_fusionne), &quot;lignes x&quot;, ncol(df_fusionne), &quot;colonnes\n&quot;)</code></pre>
+<pre><code>## Dimensions finales : 43611 lignes x 32 colonnes</code></pre>
+<pre class="r"><code>cat(&quot;Période couverte :&quot;, format(min(df_fusionne$date), &quot;%Y-%m-%d&quot;),
+    &quot;→&quot;, format(max(df_fusionne$date), &quot;%Y-%m-%d&quot;), &quot;\n&quot;)</code></pre>
+<pre><code>## Période couverte : 2019-01-08 → 2024-01-01</code></pre>
+<pre class="r"><code>cat(&quot;\nNoms des colonnes :\n&quot;)</code></pre>
+<pre><code>## 
+## Noms des colonnes :</code></pre>
+<pre class="r"><code>print(colnames(df_fusionne))</code></pre>
+<pre><code>##  [1] &quot;date&quot;                &quot;demande_energetique&quot; &quot;temperature&quot;        
+##  [4] &quot;pluie&quot;               &quot;neige&quot;               &quot;vent&quot;               
+##  [7] &quot;heure&quot;               &quot;jour&quot;                &quot;mois&quot;               
+## [10] &quot;annee&quot;               &quot;weekend&quot;             &quot;hdd&quot;                
+## [13] &quot;cdd&quot;                 &quot;temp_lag1&quot;           &quot;temp_lag24&quot;         
+## [16] &quot;temp_ma6h&quot;           &quot;temp_ma24h&quot;          &quot;mois_num&quot;           
+## [19] &quot;jour_num&quot;            &quot;heure_sin&quot;           &quot;heure_cos&quot;          
+## [22] &quot;mois_sin&quot;            &quot;mois_cos&quot;            &quot;jour_sin&quot;           
+## [25] &quot;jour_cos&quot;            &quot;temp_ma6&quot;            &quot;temp_ma24&quot;          
+## [28] &quot;demande_lag1&quot;        &quot;demande_lag24&quot;       &quot;demande_lag48&quot;      
+## [31] &quot;demande_lag168&quot;      &quot;demande_ma24&quot;</code></pre>
+<p>En regardant le jeu de donnée, la plupart des valeurs de CDD sont à
+0. Les lignes de codes suivant permettent d’observer qu’il y a bel et
+bien des valeurs ayant un CDD supérieur à 0.</p>
+</div>
+<div id="les-valeurs-ayant-un-cdd-supérieur-à-0" class="section level2">
+<h2>Les valeurs ayant un CDD supérieur à 0</h2>
+<pre class="r"><code>df_fusionne %&gt;% 
+  filter(cdd&gt;0) %&gt;% 
+  select(date, temperature, cdd) %&gt;% 
+  head(10)</code></pre>
+<pre><code>##                   date temperature cdd
+## 1  2019-05-06 13:00:00        18.9 0.9
+## 2  2019-05-06 14:00:00        19.7 1.7
+## 3  2019-05-06 15:00:00        20.4 2.4
+## 4  2019-05-06 16:00:00        20.3 2.3
+## 5  2019-05-06 17:00:00        19.8 1.8
+## 6  2019-05-06 18:00:00        18.9 0.9
+## 7  2019-05-20 11:00:00        19.4 1.4
+## 8  2019-05-20 12:00:00        20.5 2.5
+## 9  2019-05-20 13:00:00        20.9 2.9
+## 10 2019-05-20 14:00:00        20.9 2.9</code></pre>
 </div>
 </div>
 
