@@ -4,7 +4,9 @@ author: "Marie-Anne Randrianarivony"
 date: "2026-05-13"
 output: html_document
 ---
+# Contexte
 
+On cherche à prédire la demande énergétique donc il faudra faire un modèle de régression.
 # Chargement des packages
 
 
@@ -13,7 +15,7 @@ knitr::opts_chunk$set(warning = FALSE, message = FALSE)
 ```
 
 
-```{r load-packages}
+```{r load-packages, warning = FALSE}
 
 library(tidyverse)
 library(lubridate)
@@ -22,9 +24,16 @@ library(jsonlite)
 library(janitor)
 library(shiny)
 library(glue)
-library(pheatmap)
 library(ggplot2)
 library(slider)
+
+# Librairies utilisées pour la modélisation
+library(xgboost)
+library(vip)
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+
 ```
 
 ```{r load-data}
@@ -435,12 +444,6 @@ df_fusionne <- df_fusionne %>%
 df_fusionne <- df_fusionne %>% 
   drop_na()
 
-cat("Dimensions finales :", nrow(df_fusionne), "lignes x", ncol(df_fusionne), "colonnes\n")
-cat("Période couverte :", format(min(df_fusionne$date), "%Y-%m-%d"),
-    "→", format(max(df_fusionne$date), "%Y-%m-%d"), "\n")
-cat("\nNoms des colonnes :\n")
-print(colnames(df_fusionne))
-
 
 ```
 En regardant le jeu de donnée, la plupart des valeurs de CDD sont à 0. Les lignes de codes suivant permettent d'observer qu'il y a bel et bien des valeurs ayant un CDD supérieur à 0.
@@ -453,3 +456,348 @@ df_fusionne %>%
   head(10)
 ```
 
+# Modélisation
+
+## Séparation du jeu d'entraînement et du jeu de test
+```{r split-train-test}
+split_date <- df_fusionne %>% 
+  pull(date) %>% 
+  quantile(0.8) %>% 
+  as.POSIXct()
+
+df_train <- df_fusionne %>% 
+  filter(date < split_date)
+df_test <- df_fusionne %>% 
+  filter(date >= split_date)
+
+cat("Train :", nrow(df_train), "observations, intervalles de dates: ",
+    format(min(df_train$date), "%Y-%m-%d"), "jusqu'à",
+    format(max(df_train$date), "%Y-%m-%d"), "\n")
+cat("Test  :", nrow(df_test), "observations, intervalles de dates: ",
+    format(min(df_test$date), "%Y-%m-%d"), "jusqu'à",
+    format(max(df_test$date), "%Y-%m-%d"), "\n")
+```
+
+## Modèle Baseline
+```{r baseline}
+df_test_baseline <- df_test %>% 
+  mutate(pred_baseline = demande_lag24) %>% 
+  filter(!is.na(pred_baseline))
+
+mae_baseline  <- mean(abs(df_test_baseline$demande_energetique -
+                            df_test_baseline$pred_baseline), na.rm = TRUE)
+mape_baseline <- mean(abs((df_test_baseline$demande_energetique -
+                             df_test_baseline$pred_baseline) /
+                            df_test_baseline$demande_energetique)) * 100
+ss_res <- sum((df_test_baseline$demande_energetique -
+                 df_test_baseline$pred_baseline)^2, na.rm = TRUE)
+ss_tot <- sum((df_test_baseline$demande_energetique -
+                 mean(df_test_baseline$demande_energetique))^2, na.rm = TRUE)
+r2_baseline <- 1 - ss_res / ss_tot
+
+cat("Baseline (lag 24h)\n")
+cat("MAE  :", round(mae_baseline, 2), "MW\n")
+cat("MAPE :", round(mape_baseline, 2), "%\n")
+cat("R²   :", round(r2_baseline, 4), "\n")
+```
+## Preprocessing du modèle 
+
+```{r recette-generique}
+recette <- recipe(demande_energetique~., data = df_train) %>% 
+  update_role(date, new_role="ID") %>% 
+  step_rm(mois, jour) %>% 
+  step_rm(demande_lag1) %>% # retirer le lag 1h
+  # Convertir la variable Weekend en numérique
+  step_mutate(weekend = as.integer(weekend)) %>% 
+  
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_numeric_predictors())
+```
+
+## Modèle XGBOOST
+
+```{r construction-modele-XGBoost}
+spec_xgb <- boost_tree(
+  trees = 500,
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+```
+
+
+### Workflow
+
+```{r workflow-XGBoost}
+workflow_xgb <- workflow() %>% 
+  add_recipe(recette) %>% 
+  add_model(spec_xgb)
+```
+
+### Validation croisée temporelle 
+
+On va utiliser une validation croisée afin d'éviter une fuite de donnée temporelle. 
+Afin de s'assurer que les données de validation soient des données que le modèle n'a jamais vue.
+Le modèle devrait alors performer sur toute une période et pas seulement sur une période donnée.
+
+```{r validation-croisee-temporelle}
+cv_splits <- sliding_period(
+  df_train,
+  index = date,
+  period = "week",
+  lookback = 20,
+  assess_stop = 2,
+  step = 2
+)
+cat("Nombre de folds CV:", nrow(cv_splits))
+```
+
+### Grille de recherche
+```{r grille-XGBoost}
+set.seed(42)
+grille <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  learn_rate(),
+  size = 15
+)
+```
+
+
+### Réduction du temps de chargement
+
+Le tuning prend plus de 15 minutes à s'exécuter à cause du nombre de modèles à entraîner.
+On avait initialement, 93 folds * 15 combinaisons = 1935 modèles. Maintenant, on a réduit à 360 modèles.
+```{r reduction-temps}
+cv_splits_rapide <- sliding_period(
+  df_train,
+  index = date,
+  period = "week",
+  lookback = 20,
+  assess_stop = 2,
+  step = 4
+)
+
+cat("Nombre de folds:" , nrow(cv_splits_rapide), "\n")
+
+grille_rapide <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  learn_rate(),
+  size = 8 
+)
+```
+
+```{r tuning-xgb, warning=FALSE}
+resultats_tuning <- tune_grid(
+  workflow_xgb,
+  resamples = cv_splits_rapide,
+  grid = grille_rapide,
+  metrics = metric_set(mae, rmse),
+  control = control_grid(verbose = TRUE)
+)
+```
+
+
+### Choix des meilleurs hyperparamètres
+
+```{r meilleurs-hyperparamètres}
+
+best_params <- select_best(resultats_tuning, metric ="mae")
+cat("Meilleurs hyperparamètres:")
+print(best_params)
+```
+
+### Entraînement sur le jeu de donnée d'entraînement
+
+```{r training, warning =FALSE}
+workflow_final <- workflow_xgb %>% 
+  finalize_workflow(best_params)
+
+fit_final <- workflow_final %>% 
+  fit(df_train)
+```
+
+### Évaluation sur le jeu de test
+
+```{r evaluation-xgb}
+predictions <- fit_final %>% 
+  augment(df_test)
+
+mae_xgb  <- mean(abs(predictions$demande_energetique -
+                       predictions$.pred), na.rm = TRUE)
+mape_xgb <- mean(abs((predictions$demande_energetique -
+                        predictions$.pred) /
+                       predictions$demande_energetique)) * 100
+ss_res_xgb <- sum((predictions$demande_energetique -
+                     predictions$.pred)^2, na.rm = TRUE)
+ss_tot_xgb <- sum((predictions$demande_energetique -
+                     mean(predictions$demande_energetique))^2, na.rm = TRUE)
+r2_xgb <- 1 - ss_res_xgb / ss_tot_xgb
+
+
+```
+
+## Test d'autres modèles pour amélioration: Régression Linéaire avec régularisation
+
+```{r construction-du-modele}
+spec_glmnet <- linear_reg(
+  penalty = tune(), 
+  
+  mixture = tune()
+) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+```
+
+**Penalty** permet de **pénaliser le modèle** si les coefficients sont trop grand.
+
+**Mixture** au type de régularisation. Le tuning va choisir entre la **régularisation de Ridge ou celle de Lasso**.
+
+### Workflow
+```{r workflow}
+workflow_glmnet <- workflow() %>% 
+  add_recipe(recette) %>% 
+  add_model(spec_glmnet)
+
+```
+
+### Grille de recherche
+```{r grille-de-recherche}
+grille_glmnet <- grid_latin_hypercube(
+  penalty(),
+  mixture(),
+  size = 15
+)
+```
+
+### Tuning et meilleurs hyperparamètres à choisir
+```{r tuning-glm}
+
+resultats_glmnet <- tune_grid(
+  workflow_glmnet,
+  resamples = cv_splits,
+  grid = grille_glmnet,
+  metrics = metric_set(mae, rmse),
+  control = control_grid(verbose = TRUE)
+)
+
+meilleurs_params_glmnet <- select_best(resultats_glmnet, metric="mae")
+cat("Meilleurs hyperparamètres glmnet: ")
+print(meilleurs_params_glmnet)
+```
+Les coefficients ne sont pratiquement pas pénalisés. La régularisation est faible.
+
+### Entraînement
+```{r entrainement-final}
+fit_glmnet <- workflow_glmnet %>% 
+  finalize_workflow(meilleurs_params_glmnet) %>% 
+  fit(df_train)
+```
+
+### Évaluation
+
+```{r evaluation-glm}
+pred_glmnet <- fit_glmnet %>% 
+  augment(df_test)
+
+#Erreur absolue moyenne
+mae_glmnet <- mean(abs(pred_glmnet$demande_energetique -
+                          pred_glmnet$.pred), na.rm =TRUE)
+
+# Erreur absolue moyenne en pourcentage
+mape_glmnet <- mean(abs((pred_glmnet$demande_energetique -
+                          pred_glmnet$.pred) /
+                          pred_glmnet$demande_energetique) * 100, na.rm=TRUE)
+
+
+# Somme des carrés des erreurs
+ss_res_glmnet <- sum((pred_glmnet$demande_energetique - pred_glmnet$.pred)^2, na.rm =TRUE)
+
+# Somme des carrées des écarts 
+ss_tot_glmnet <- sum((pred_glmnet$demande_energetique - mean(pred_glmnet$demande_energetique))^2, na.rm = TRUE)
+                   
+r2_glmnet <- 1 - ss_res_glmnet / ss_tot_glmnet
+                   
+```
+
+## Tableau comparatif final avec tous les modèles testés
+```{r tableau-comparatif}
+cat("\n Comparaison des modèles \n")
+cat(sprintf("%-25s %10s %10s %10s %12s\n",
+            "Modèle", "MAE (MW)", "MAPE (%)", "R²", "Taux préd."))
+cat(rep("-", 70), "\n", sep = "")
+cat(sprintf("%-25s %10.2f %10.2f %10.4f %11.2f%%\n",
+            "Baseline (lag 24h)",
+            mae_baseline, mape_baseline, r2_baseline, 100 - mape_baseline))
+cat(sprintf("%-25s %10.2f %10.2f %10.4f %11.2f%%\n",
+            "Régression linéaire",
+            mae_glmnet, mape_glmnet, r2_glmnet, 100 - mape_glmnet))
+cat(sprintf("%-25s %10.2f %10.2f %10.4f %11.2f%%\n",
+            "XGBoost",
+            mae_xgb, mape_xgb, r2_xgb, 100 - mape_xgb))
+
+```
+
+Le modèle **Baseline** se trompe de 4.77%. Il prédit correctement à 95.23%.
+
+Le modèle **Régression linéaire** se trompe de 3.25% et prédit correctement à 96.75%.
+
+Le modèle **XGBoost** se trompe de 1.78% et prédit correctement à 98.22%.
+
+## Conclusion préliminaire
+
+Le modèle **XGBoost** demeure le meilleur parmi les autres modèles avec un taux de prédiction à 98.22%.
+
+## Est-ce qu'on est dans un cas de surapprentissage ou sous-apprentissage
+
+```{r surapprentissage-sousapprentissage}
+# Extraction des métriques MAE par fold pour la meilleure configuration
+courbe_validation <- collect_metrics(resultats_tuning, summarize = FALSE) %>%
+  filter(
+    .metric == "mae",
+    .config == best_params$.config
+  ) %>%
+  arrange(id) %>%
+  mutate(fold_num = row_number())
+
+# Calculer le MAE sur le train fold par fold
+mae_train_folds <- map_dbl(cv_splits_rapide$splits, function(split) {
+  df_fold_train <- training(split)
+  pred_fold <- fit_final %>% augment(df_fold_train)
+  mean(abs(pred_fold$demande_energetique - pred_fold$.pred), na.rm = TRUE)
+})
+
+# Combiner train et validation
+df_courbes <- bind_rows(
+  tibble(
+    fold       = seq_along(mae_train_folds),
+    mae        = mae_train_folds,
+    ensemble   = "Entraînement"
+  ),
+  tibble(
+    fold       = courbe_validation$fold_num,
+    mae        = courbe_validation$.estimate,
+    ensemble   = "Validation"
+  )
+)
+
+ggplot(df_courbes, aes(x = fold, y = mae, color = ensemble)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "Entraînement" = "#EF9F27",
+    "Validation"   = "#085041"
+  )) +
+  labs(
+    title    = "Courbes d'apprentissage — MAE par fold",
+    subtitle = "Entraînement vs Validation au fil des folds temporels",
+    x        = "Fold (progression dans le temps)",
+    y        = "MAE (MW)",
+    color    = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+```
