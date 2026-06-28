@@ -7,6 +7,7 @@ output: html_document
 # Contexte
 
 On cherche à prédire la demande énergétique donc il faudra faire un modèle de régression.
+
 # Chargement des packages
 
 
@@ -640,7 +641,7 @@ r2_xgb <- 1 - ss_res_xgb / ss_tot_xgb
 
 ```
 
-## Test d'autres modèles pour amélioration: Régression Linéaire avec régularisation
+## Modèle Régression Linéaire avec régularisation
 
 ```{r construction-du-modele}
 spec_glmnet <- linear_reg(
@@ -801,3 +802,50 @@ ggplot(df_courbes, aes(x = fold, y = mae, color = ensemble)) +
   theme_minimal(base_size = 12) +
   theme(legend.position = "top")
 ```
+
+## Sauvegarde des fichiers pour le dashboard
+
+```{r sauvegarde-fichier-shiny}
+# Création des dossiers 
+dir.create("model",            showWarnings = FALSE)
+dir.create("data/processed",   recursive = TRUE, showWarnings = FALSE)
+
+# Sauvegarde des données Hydro Québec
+write_csv(df,
+          "data/processed/energetique.csv")
+
+# Sauvegarde des données météorologiques
+write_csv(df_meteo,
+          "data/processed/meteo.csv")
+
+# Sauvegarde des données fusionnées
+write_csv(df_fusionne, "data/processed/donnee_fusionne.csv")
+# Sauvegarde de train et test
+write_csv(df_train, "data/processed/train.csv")
+write_csv(df_test, "data/processed/test.csv")
+
+# Sauvegarde du modèle XGBoost
+saveRDS(fit_final,        "model/xgboost_energie.rds")
+
+# Sauvegarde des résultats de tuning
+saveRDS(resultats_tuning, "model/resultats_tuning.rds")
+
+# Sauvegarde des prédictions du jeu de test
+predictions %>%
+  select(date, demande_energetique, pred_xgb = .pred) %>%
+  write_csv("data/processed/predictions_test.csv")
+
+# Vérification des fichiers sauvegardés 
+cat("Vérification des fichiers :\n")
+cat("xgboost_energie.rds    :", file.exists("model/xgboost_energie.rds"), "\n")
+cat("resultats_tuning.rds   :", file.exists("model/resultats_tuning.rds"), "\n")
+cat("predictions_test.csv   :", file.exists("data/processed/predictions_test.csv"), "\n")
+cat("train.csv          :", 
+    file.exists("data/processed/train.csv"),  "\n")
+cat("test.csv          :", 
+    file.exists("data/processed/test.csv"),  "\n")
+cat("donnee_fusionne.csv          :", 
+    file.exists("data/processed/donnee_fusionne.csv"),  "\n")
+
+```
+
